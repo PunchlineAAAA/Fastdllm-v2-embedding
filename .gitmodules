@@ -1,0 +1,6 @@
+[submodule "DiffEmbed"]
+	path = DiffEmbed
+	url = https://github.com/PunchlineAAAA/DiffEmbed
+[submodule "Fast-dLLM"]
+	path = Fast-dLLM
+	url = https://github.com/PunchlineAAAA/Fast-dLLM
