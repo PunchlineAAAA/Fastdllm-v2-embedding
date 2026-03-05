@@ -32,6 +32,25 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+def _ensure_transformers_layer_type_validation():
+    """
+    Backward-compatibility shim for remote configs that import
+    `layer_type_validation` from `transformers.configuration_utils`.
+    Some Transformers versions do not expose this symbol.
+    """
+    try:
+        from transformers import configuration_utils as cu
+    except Exception:
+        return
+
+    if hasattr(cu, "layer_type_validation"):
+        return
+
+    def _layer_type_validation(layer_type):
+        return layer_type
+
+    cu.layer_type_validation = _layer_type_validation
+
 
 def batch_to_device(batch, target_device: device):
     """
@@ -76,6 +95,12 @@ class LLM2Vec(nn.Module):
             return GemmaBiModel
         elif config_class_name == "Qwen2Config":
             return Qwen2BiModel
+        elif config_class_name in ["Fast_dLLM_QwenConfig", "FastdLLMQwenConfig"]:
+            # Fast-dLLM v2 reuses the Qwen backbone with a custom config class name.
+            return Qwen2BiModel
+        elif "Qwen" in config_class_name:
+            # Fallback for Qwen-compatible remote configs with non-standard class names.
+            return Qwen2BiModel
         elif config_class_name == "DreamConfig":
             return DreamBiModel
         else:
@@ -105,11 +130,48 @@ class LLM2Vec(nn.Module):
             base_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
         
 
-        tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, trust_remote_code=True)
+        if os.path.isdir(base_model_name_or_path):
+            has_hf_config = os.path.exists(f"{base_model_name_or_path}/config.json")
+            if not has_hf_config:
+                raise ValueError(
+                    f"`base_model_name_or_path={base_model_name_or_path}` looks like a local code directory, "
+                    "but no HuggingFace `config.json` was found. "
+                    "Please pass a model id (e.g. `Efficient-Large-Model/Fast_dLLM_v2_7B`) "
+                    "or a local checkpoint snapshot directory that contains `config.json`."
+                )
+
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                base_model_name_or_path,
+                trust_remote_code=True,
+                use_fast=True,
+            )
+        except Exception as e:
+            logger.warning(
+                "fast tokenizer failed, fallback to slow tokenizer for %s: %s",
+                base_model_name_or_path,
+                e,
+            )
+            tokenizer = AutoTokenizer.from_pretrained(
+                base_model_name_or_path,
+                trust_remote_code=True,
+                use_fast=False,
+            )
+            
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
-        config = AutoConfig.from_pretrained(base_model_name_or_path, trust_remote_code=True)
+        _ensure_transformers_layer_type_validation()
+        try:
+            config = AutoConfig.from_pretrained(base_model_name_or_path, trust_remote_code=True)
+        except ImportError as e:
+            if "layer_type_validation" in str(e):
+                raise ImportError(
+                    "Failed to import Fast-dLLM v2 remote config due to Transformers compatibility: "
+                    "missing `layer_type_validation`. Please upgrade transformers to a version compatible "
+                    "with Efficient-Large-Model/Fast_dLLM_v2_7B, or pin to the model's recommended version."
+                ) from e
+            raise
         config_class_name = config.__class__.__name__
 
         model_class = cls._get_model_class(
