@@ -2,7 +2,7 @@ import logging
 from dataclasses import dataclass, field
 import os
 os.environ["WANDB_PROJECT"] = "Grit"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -424,6 +424,30 @@ class RepllamaLLM2VecSupervisedTrainer(LLM2VecSupervisedTrainer):
 
 
 
+
+
+def _assert_cuda_kernel_compatibility():
+    """Fail fast when GPU arch is unsupported by current PyTorch build."""
+    if not torch.cuda.is_available():
+        return
+
+    try:
+        major, minor = torch.cuda.get_device_capability()
+        current_sm = f"sm_{major}{minor}"
+        supported_sms = set(torch.cuda.get_arch_list())
+    except Exception:
+        return
+
+    if current_sm not in supported_sms:
+        raise RuntimeError(
+            "CUDA kernel compatibility check failed: current GPU arch "
+            f"`{current_sm}` is not in torch supported arch list {sorted(supported_sms)}. "
+            "This typically causes `CUDA error: no kernel image is available for execution on the device`. "
+            "Please install a PyTorch/CUDA build that supports your GPU architecture, "
+            "or run on a compatible GPU."
+        )
+
+
 def main():
     parser = HfArgumentParser(
         (ModelArguments, DataTrainingArguments, TrainingArguments, CustomArguments)
@@ -458,6 +482,7 @@ def main():
     accelerator = Accelerator(kwargs_handlers=kwargs)
 
     set_seed(training_args.seed)
+    _assert_cuda_kernel_compatibility()
 
     if training_args.gradient_checkpointing:
         training_args.gradient_checkpointing_kwargs = {"use_reentrant": False}
