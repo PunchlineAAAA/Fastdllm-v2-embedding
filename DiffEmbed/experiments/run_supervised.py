@@ -31,6 +31,7 @@ from transformers.trainer_utils import seed_worker
 from peft import LoraConfig, get_peft_model
 
 from llm2vec import LLM2Vec
+from llm2vec.instruction import UNKNOWN_OPERATION_ID
 from llm2vec.dataset.utils import load_dataset
 from llm2vec.loss.utils import load_loss
 from llm2vec.experiment_utils import generate_experiment_id
@@ -165,6 +166,10 @@ class ModelArguments:
     skip_instruction: Optional[bool] = field(
         default=False,
     )
+    dual_head: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Enable topic/instruction dual-head embeddings."},
+    )
     torch_dtype: Optional[str] = field(
         default=None,
         metadata={
@@ -262,6 +267,9 @@ class CustomArguments:
     scale_by_dim: bool = field(
         default=False, metadata={"help": "The loss margin for the loss function"}
     )
+    instruction_loss_weight: float = field(
+        default=0.0, metadata={"help": "Weight for query operation supervision when dual_head is enabled."}
+    )
 
 
 class DefaultCollator:
@@ -294,6 +302,7 @@ class DefaultCollator:
         num_texts = len(batch[0].texts)
         texts = [[] for _ in range(num_texts)]
         labels = []
+        operation_labels = []
 
         for example in batch:
             for idx, text in enumerate(example.texts):
@@ -302,6 +311,7 @@ class DefaultCollator:
                 )
                 texts[idx].append(text)
             labels.append(example.label)
+            operation_labels.append(example.metadata.get("operation_id", UNKNOWN_OPERATION_ID))
         if not self.use_repllama_loss:
             labels = torch.tensor(labels)
 
@@ -310,7 +320,8 @@ class DefaultCollator:
             tokenized = self.model.tokenize(texts[idx])
             sentence_features.append(tokenized)
 
-        return sentence_features, labels
+        metadata = {"operation_labels": torch.tensor(operation_labels, dtype=torch.long)}
+        return sentence_features, labels, metadata
 
 class StopTrainingCallback(TrainerCallback):
     def __init__(self, stop_after_n_steps: int):
@@ -326,10 +337,12 @@ class LLM2VecSupervisedTrainer(Trainer):
         self,
         *args,
         loss_function=None,
+        instruction_loss_weight: float = 0.0,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.loss_function = loss_function
+        self.instruction_loss_weight = instruction_loss_weight
 
     def compute_loss(
         self,
@@ -337,14 +350,17 @@ class LLM2VecSupervisedTrainer(Trainer):
         inputs: Dict[str, Union[torch.Tensor, Any]],
         return_outputs: bool = False,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
-        features, labels = inputs
+        features, labels, metadata = inputs
         q_reps = self.model(features[0])
         d_reps = self.model(features[1])
         d_reps_neg = None
         if len(features) > 2:
-            d_reps_neg = self.model(features[2])
+            negative_reps = [self.model(row) for row in features[2:]]
+            d_reps_neg = torch.cat(negative_reps, dim=0)
 
-        loss = self.loss_function(q_reps, d_reps, d_reps_neg)
+        loss = self.loss_function(q_reps, d_reps, d_reps_neg, metadata=metadata)
+        if getattr(self.model, "dual_head", False) and self.instruction_loss_weight > 0:
+            loss = loss + self.instruction_loss_weight * self.model.compute_instruction_loss(q_reps, metadata.get("operation_labels"))
 
         if return_outputs:
             output = torch.cat(
@@ -403,7 +419,7 @@ class RepllamaLLM2VecSupervisedTrainer(LLM2VecSupervisedTrainer):
         return_outputs: bool = False,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
 
-        features, _ = inputs
+        features, _, metadata = inputs
         # Custom model forward logic
         q_reps = model(features[0])
         d_reps = model(features[1])
@@ -522,8 +538,9 @@ def main():
         domain=data_args.domain,
         aug_file_path=data_args.aug_file_path,
         task=data_args.task,
-        add_e5=data_args.add_e5
-        * accelerator.num_processes,
+        add_e5=data_args.add_e5 * accelerator.num_processes,
+        enable_instruction_labels=model_args.dual_head,
+        enable_instruction_conflicting_negatives=model_args.dual_head,
     )
 
     train_examples = [
@@ -554,6 +571,7 @@ def main():
         attn_implementation=model_args.attn_implementation,
         skip_instruction=model_args.skip_instruction,
         doc_max_length=model_args.doc_max_length,
+        dual_head=model_args.dual_head,
     )
 
     if not is_simcse:
@@ -567,6 +585,14 @@ def main():
         )
 
     tokenizer = model.tokenizer
+
+    if (
+        custom_args.loss_class == "InstructionAwareHardNegativeNLLLoss"
+        and not model_args.dual_head
+    ):
+        raise ValueError(
+            "InstructionAwareHardNegativeNLLLoss requires dual_head=True."
+        )
 
     use_repllama_loss = custom_args.loss_class == "RepllamaLoss"
     if use_repllama_loss:
@@ -584,6 +610,7 @@ def main():
         data_collator=data_collator,
         tokenizer=tokenizer,
         loss_function=train_loss,
+        instruction_loss_weight=custom_args.instruction_loss_weight,
     )
 
     if custom_args.stop_after_n_steps is not None:

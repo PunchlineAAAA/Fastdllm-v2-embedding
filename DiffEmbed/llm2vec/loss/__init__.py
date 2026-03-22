@@ -1,2 +1,3 @@
 from .HardNegativeNLLLoss import HardNegativeNLLLoss
+from .InstructionAwareHardNegativeNLLLoss import InstructionAwareHardNegativeNLLLoss
 from .RepllamaLoss import RepllamaLoss

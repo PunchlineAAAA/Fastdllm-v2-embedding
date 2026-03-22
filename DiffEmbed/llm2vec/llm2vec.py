@@ -3,11 +3,14 @@ import logging
 import os
 from functools import partial
 from typing import Dict, List, Optional, Union
+
+import torch.nn.functional as F
 from copy import deepcopy
 
 import numpy as np
 import torch
 import torch.multiprocessing as mp
+from huggingface_hub import hf_hub_download
 from peft import PeftModel
 from torch import Tensor, device, nn
 from tqdm.autonotebook import tqdm, trange
@@ -71,6 +74,8 @@ class LLM2Vec(nn.Module):
         max_length: int = 512,
         doc_max_length: int = 400,
         skip_instruction: bool = True,
+        dual_head: bool = False,
+        instruction_label_count: int = 5,
     ):
         super().__init__()
         self.model = model
@@ -80,6 +85,71 @@ class LLM2Vec(nn.Module):
         self.max_length = max_length
         self.doc_max_length = doc_max_length
         self.config = model.config
+        self.dual_head = dual_head
+        self.instruction_label_count = instruction_label_count
+        hidden_size = getattr(model.config, "hidden_size", None) or getattr(model.config, "d_model", None)
+        if self.dual_head and hidden_size is None:
+            raise ValueError("dual_head requires model hidden size in config")
+        if self.dual_head:
+            parameter_dtype = next(model.parameters()).dtype
+            self.topic_head = nn.Linear(hidden_size, hidden_size, bias=False, dtype=parameter_dtype)
+            self.instruction_head = nn.Linear(hidden_size, hidden_size, bias=False, dtype=parameter_dtype)
+            self.operation_classifier = nn.Linear(hidden_size, instruction_label_count, dtype=parameter_dtype)
+
+    @staticmethod
+    def _resolve_artifact_path(model_name_or_path: str, filename: str) -> Optional[str]:
+        local_path = os.path.join(model_name_or_path, filename)
+        if os.path.exists(local_path):
+            return local_path
+        if os.path.isdir(model_name_or_path):
+            return None
+        try:
+            return hf_hub_download(repo_id=model_name_or_path, filename=filename)
+        except Exception:
+            return None
+
+    def _wrapper_dtype(self) -> str:
+        if not self.dual_head:
+            raise ValueError("wrapper dtype is only defined for dual_head models")
+        return str(self.topic_head.weight.dtype)
+
+    def _wrapper_state_dict(self) -> dict[str, dict[str, Tensor] | dict[str, object]]:
+        if not self.dual_head:
+            return {}
+        return {
+            "metadata": {
+                "dual_head": self.dual_head,
+                "instruction_label_count": self.instruction_label_count,
+                "wrapper_dtype": self._wrapper_dtype(),
+            },
+            "topic_head": self.topic_head.state_dict(),
+            "instruction_head": self.instruction_head.state_dict(),
+            "operation_classifier": self.operation_classifier.state_dict(),
+        }
+
+    def _load_wrapper_state_dict(
+        self, state_dict: dict[str, dict[str, Tensor] | dict[str, object]]
+    ) -> None:
+        if not self.dual_head:
+            return
+        metadata = state_dict["metadata"]
+        if metadata["dual_head"] != self.dual_head:
+            raise ValueError(
+                "Dual-head checkpoint metadata does not match the current model configuration."
+            )
+        if metadata["instruction_label_count"] != self.instruction_label_count:
+            raise ValueError(
+                "Instruction label count in checkpoint metadata does not match the current model."
+            )
+        current_wrapper_dtype = self._wrapper_dtype()
+        if metadata["wrapper_dtype"] != current_wrapper_dtype:
+            raise ValueError(
+                "Wrapper dtype in checkpoint metadata does not match the current model. "
+                f"checkpoint={metadata['wrapper_dtype']} current={current_wrapper_dtype}"
+            )
+        self.topic_head.load_state_dict(state_dict["topic_head"])
+        self.instruction_head.load_state_dict(state_dict["instruction_head"])
+        self.operation_classifier.load_state_dict(state_dict["operation_classifier"])
 
     @classmethod
     def _get_model_class(cls, config_class_name, enable_bidirectional):
@@ -118,7 +188,7 @@ class LLM2Vec(nn.Module):
         **kwargs,
     ):
         # pop out encoder args
-        keys = ["pooling_mode", "max_length", "doc_max_length", "skip_instruction"]
+        keys = ["pooling_mode", "max_length", "doc_max_length", "skip_instruction", "dual_head", "instruction_label_count"]
         encoder_args = {
             key: kwargs.pop(key, None) for key in keys if kwargs.get(key) is not None
         }
@@ -228,10 +298,15 @@ class LLM2Vec(nn.Module):
             if peft_model_name_or_path is not None
             else base_model_name_or_path
         )
-        if os.path.exists(f"{config_addr}/llm2vec_config.json"):
-            with open(f"{config_addr}/llm2vec_config.json", "r") as fIn:
+        llm2vec_config_path = cls._resolve_artifact_path(
+            config_addr, "llm2vec_config.json"
+        )
+        checkpoint_has_dual_head = False
+        if llm2vec_config_path is not None:
+            with open(llm2vec_config_path, "r") as fIn:
                 llm2vec_config = json.load(fIn)
             config.update(llm2vec_config)
+            checkpoint_has_dual_head = bool(llm2vec_config.get("dual_head", False))
 
         if base_model_name_or_path == "intfloat/e5-mistral-7b-instruct":
             llm2vec_config = {
@@ -247,7 +322,24 @@ class LLM2Vec(nn.Module):
         for key, value in encoder_args.items():
             config[key] = value
 
-        return cls(model=model, tokenizer=tokenizer, **config)
+        instance = cls(model=model, tokenizer=tokenizer, **config)
+        if checkpoint_has_dual_head:
+            wrapper_state_path = cls._resolve_artifact_path(
+                config_addr, "llm2vec_state.pt"
+            )
+            if wrapper_state_path is None:
+                raise ValueError(
+                    f"Dual-head checkpoint at `{config_addr}` is missing `llm2vec_state.pt`."
+                )
+            wrapper_state = torch.load(wrapper_state_path, map_location="cpu")
+            instance._load_wrapper_state_dict(wrapper_state)
+        elif instance.dual_head:
+            logger.info(
+                "Initializing a new dual-head wrapper for `%s` because the source checkpoint "
+                "does not contain dual-head wrapper state.",
+                config_addr,
+            )
+        return instance
     
 
     def prepare_for_tokenization(self, text):
@@ -358,7 +450,42 @@ class LLM2Vec(nn.Module):
         reps = self.model(**sentence_feature)
         sentence_feature["embed_mask"] = embed_mask
 
-        return self.get_pooling(sentence_feature, reps.last_hidden_state)
+        pooled = self.get_pooling(sentence_feature, reps.last_hidden_state)
+        if not self.dual_head:
+            return pooled
+
+        topic = self.topic_head(pooled)
+        instruction = self.instruction_head(pooled)
+        return torch.cat([topic, instruction], dim=-1)
+
+    def split_dual_head(self, reps: Tensor):
+        if not self.dual_head:
+            return reps, None
+        half = reps.shape[-1] // 2
+        return reps[:, :half], reps[:, half:]
+
+    def compute_instruction_loss(self, q_reps: Tensor, operation_labels):
+        if not self.dual_head or operation_labels is None:
+            return q_reps.new_tensor(0.0)
+        _, instruction_reps = self.split_dual_head(q_reps)
+        labels = operation_labels.to(q_reps.device)
+        valid_mask = labels >= 0
+        if not torch.any(valid_mask):
+            return q_reps.new_tensor(0.0)
+        normalized_instruction_reps = F.normalize(
+            instruction_reps[valid_mask].float(), p=2, dim=-1
+        )
+        classifier_bias = (
+            self.operation_classifier.bias.float()
+            if self.operation_classifier.bias is not None
+            else None
+        )
+        logits = F.linear(
+            normalized_instruction_reps,
+            self.operation_classifier.weight.float(),
+            classifier_bias,
+        )
+        return F.cross_entropy(logits, labels[valid_mask])
 
     def get_pooling(self, features, last_hidden_states):  # All models padded from left
         assert (
@@ -547,12 +674,19 @@ class LLM2Vec(nn.Module):
             "max_length": self.max_length,
             "doc_max_length": self.doc_max_length,
             "skip_instruction": self.skip_instruction,
+            "dual_head": self.dual_head,
+            "instruction_label_count": self.instruction_label_count,
         }
 
         if save_config:
             os.makedirs(output_path, exist_ok=True)
             with open(f"{output_path}/llm2vec_config.json", "w") as fOut:
                 json.dump(llm2vec_config, fOut, indent=4)
+        if self.dual_head:
+            torch.save(
+                self._wrapper_state_dict(),
+                os.path.join(output_path, "llm2vec_state.pt"),
+            )
 
     def _encode(
         self,

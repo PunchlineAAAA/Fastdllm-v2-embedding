@@ -1,9 +1,12 @@
 from .HardNegativeNLLLoss import HardNegativeNLLLoss
+from .InstructionAwareHardNegativeNLLLoss import InstructionAwareHardNegativeNLLLoss
 from .RepllamaLoss import RepllamaLoss
 
 def load_loss(loss_class, *args, **kwargs):
     if loss_class == "HardNegativeNLLLoss":
         loss_cls = HardNegativeNLLLoss
+    elif loss_class == "InstructionAwareHardNegativeNLLLoss":
+        loss_cls = InstructionAwareHardNegativeNLLLoss
     elif loss_class == 'RepllamaLoss':
         loss_cls = RepllamaLoss
     else:

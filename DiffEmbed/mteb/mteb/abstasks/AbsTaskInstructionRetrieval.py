@@ -110,11 +110,12 @@ class HFDataLoaderInstructions(HFDataLoader):
         def qrels_changed_dict_init(row):
             changed_qrels_dict[row["query-id"]][row["corpus-id"]] = int(row["score"])
 
-        self.changed_qrels.map(qrels_dict_init)
-        self.og_qrels.map(qrels_changed_dict_init)
+        self.og_qrels.map(qrels_dict_init)
+        self.changed_qrels.map(qrels_changed_dict_init)
         self.og_qrels = og_qrels_dict
         self.changed_qrels = changed_qrels_dict
-        self.queries = self.queries.filter(lambda x: x["id"] in self.og_qrels)
+        valid_query_ids = set(self.og_qrels).intersection(self.changed_qrels)
+        self.queries = self.queries.filter(lambda x: x["id"] in valid_query_ids)
         logger.info("Loaded %d %s Queries.", len(self.queries), split.upper())
         logger.info("Query Example: %s", self.queries[0])
 
@@ -306,15 +307,15 @@ class AbsTaskInstructionRetrieval(AbsTask):
                 for cur_inst in top_ranked_init
             ]
             og_instructions = {
-                query["text"]: query["instruction_og"] for query in queries
+                query["id"]: query["instruction_og"] for query in queries
             }
             changed_instructions = {
-                query["text"]: query["instruction_changed"] for query in queries
+                query["id"]: query["instruction_changed"] for query in queries
             }
             if self.do_length_ablation:
-                keywords = {query["text"]: query["keywords"] for query in queries}
+                keywords = {query["id"]: query["keywords"] for query in queries}
                 short_instructions = {
-                    query["text"]: query["short_query"] for query in queries
+                    query["id"]: query["short_query"] for query in queries
                 }
             queries = {query["id"]: query["text"] for query in queries}
             corpus = {
@@ -323,7 +324,7 @@ class AbsTaskInstructionRetrieval(AbsTask):
             }
             assert (
                 len(top_ranked) == len(queries)
-            ), f"Top ranked not loaded properly! Expected {len(self.queries)} but got {len(self.top_ranked)}."
+            ), f"Top ranked not loaded properly! Expected {len(queries)} but got {len(top_ranked)}."
 
             (
                 self.corpus[split],
@@ -380,6 +381,7 @@ class AbsTaskInstructionRetrieval(AbsTask):
             og_instructions,
             top_ranked,
             lang,
+            variant="original",
             **kwargs,
         )
         scores_changed, results_changed = self._evaluate_subset(
@@ -390,6 +392,7 @@ class AbsTaskInstructionRetrieval(AbsTask):
             changed_instructions,
             top_ranked,
             lang,
+            variant="changed",
             **kwargs,
         )
 
@@ -419,6 +422,7 @@ class AbsTaskInstructionRetrieval(AbsTask):
                 defaultdict(str),
                 top_ranked,
                 lang,
+                variant="base",
                 **kwargs,
             )
             scores_w_keywords_scores, scores_w_keywords_results = self._evaluate_subset(
@@ -429,6 +433,7 @@ class AbsTaskInstructionRetrieval(AbsTask):
                 keywords,
                 top_ranked,
                 lang,
+                variant="keywords",
                 **kwargs,
             )
             (
@@ -442,6 +447,7 @@ class AbsTaskInstructionRetrieval(AbsTask):
                 short_instructions,
                 top_ranked,
                 lang,
+                variant="short",
                 **kwargs,
             )
             overall_changed_scores["length_ablation"] = {
@@ -523,6 +529,7 @@ class AbsTaskInstructionRetrieval(AbsTask):
         instructions: dict[str, str],
         top_ranked: dict[str, list[str]],
         lang=None,
+        variant: str = "default",
         **kwargs,
     ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
         start_time = time()
@@ -531,7 +538,7 @@ class AbsTaskInstructionRetrieval(AbsTask):
         all_results = []
         for query_id in tqdm.tqdm(list(queries.keys()), leave=False, desc="Retrieving"):
             cur_queries = {query_id: queries[query_id]}
-            cur_instructions = {queries[query_id]: instructions[queries[query_id]]}
+            cur_instructions = {queries[query_id]: instructions[query_id]}
             cur_docs = {
                 key: value
                 for (key, value) in corpus.items()
@@ -565,12 +572,11 @@ class AbsTaskInstructionRetrieval(AbsTask):
                     results[qid] = {
                         k: v for k, v in results[qid].items() if k in doc_ids
                     }
-            if lang is None:
-                qrels_save_path = (
-                    f"{output_folder}/{self.metadata_dict['name']}_predictions.json"
-                )
-            else:
-                qrels_save_path = f"{output_folder}/{self.metadata_dict['name']}_{lang}_predictions.json"
+            qrels_save_path = self._prediction_path(
+                output_folder=output_folder,
+                lang=lang,
+                variant=variant,
+            )
 
             with open(qrels_save_path, "w") as f:
                 json.dump(results, f)
@@ -594,12 +600,21 @@ class AbsTaskInstructionRetrieval(AbsTask):
         }
         return scores, results
 
+    def _prediction_path(self, output_folder: str, lang: str | None, variant: str) -> str:
+        suffix = f"_{lang}" if lang is not None else ""
+        variant_suffix = f"_{variant}" if variant else ""
+        return (
+            f"{output_folder}/"
+            f"{self.metadata_dict['name']}{suffix}{variant_suffix}_predictions.json"
+        )
+
     def create_qrel_diff(self, og_qrels, changed_qrels):
         newly_irrelevant_qrels = {}
-        for qid in og_qrels:
+        for qid in set(og_qrels).intersection(changed_qrels):
             newly_irrelevant_qrels[qid] = []
-            for doc_id in og_qrels[qid]:
-                if changed_qrels[qid][doc_id] != og_qrels[qid][doc_id]:
+            doc_ids = set(og_qrels[qid]).union(changed_qrels[qid])
+            for doc_id in sorted(doc_ids):
+                if changed_qrels[qid].get(doc_id, 0) != og_qrels[qid].get(doc_id, 0):
                     newly_irrelevant_qrels[qid].append(doc_id)
 
         return newly_irrelevant_qrels

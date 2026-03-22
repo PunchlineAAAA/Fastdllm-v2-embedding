@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Any, Dict
 from typing import Union, List
 
 import torch
@@ -14,6 +15,7 @@ class DataSample:
     pos_instance: str = None
     neg_instance: str = None
     batch_negatives: list = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 class TrainSample:
     """
@@ -21,7 +23,7 @@ class TrainSample:
     """
 
     def __init__(
-        self, guid: str = "", texts: List[str] = None, label: Union[int, float] = 0
+        self, guid: str = "", texts: List[str] = None, label: Union[int, float] = 0, metadata: Dict[str, Any] = None
     ):
         """
         Creates one TrainSample with the given texts, guid and label
@@ -37,6 +39,7 @@ class TrainSample:
         self.guid = guid
         self.texts = texts
         self.label = label
+        self.metadata = metadata or {}
 
     def __str__(self):
         return "<TrainSample> label: {}, texts: {}".format(
