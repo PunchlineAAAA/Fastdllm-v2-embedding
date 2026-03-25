@@ -242,7 +242,7 @@ class ReasonIR(Dataset):
 #############################################
 
         ## NEW
-        with open("/home/siyue/Projects/diffusion_embedder/ReasonAug/ReasonAug.jsonl", "r", encoding="utf-8") as f:
+        with open("ReasonAug/ReasonAug.jsonl", "r", encoding="utf-8") as f:
             augment_samples = f.readlines()
         augment_samples = [json.loads(d) for d in augment_samples]
         print('total number: ', len(augment_samples))
